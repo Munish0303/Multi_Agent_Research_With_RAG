@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+
+# Environment — never commit real keys
+.env
+
+# Runtime data — generated at startup, not source code
+data/vectordb/
+data/uploads/*
+!data/uploads/.gitkeep
+outputs/*
+!outputs/.gitkeep
+
+# Keep the sample report so visitors can see what a finished report looks like
+!example_output/
+
+# Database
+*.db
+*.sqlite3
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Claude internal files
+.claude/

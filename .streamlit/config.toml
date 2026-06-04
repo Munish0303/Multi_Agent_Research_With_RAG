@@ -1,0 +1,13 @@
+[theme]
+primaryColor = "#1946aa"
+backgroundColor = "#ffffff"
+secondaryBackgroundColor = "#f3f6fb"
+textColor = "#1a1a1a"
+font = "sans serif"
+
+[server]
+# Research runs are long; don't let the browser time out the websocket early
+maxUploadSize = 50
+
+[browser]
+gatherUsageStats = false

@@ -1,0 +1,46 @@
+# Core LLM / agent framework
+langchain==0.3.25
+langchain-core>=0.3.60,<0.4   # pin: prevent groq from pulling core 1.x
+langchain-community==0.3.24
+langchain-ollama==0.3.3
+langchain-chroma==0.2.4
+langgraph==0.4.5
+langsmith>=0.1.17,<0.2        # pin below 0.2 — langsmith>=0.2 needs zstandard which has no 3.14 wheel
+
+# Cloud LLM provider (Groq — used when GROQ_API_KEY is set)
+# Upper bound required: groq>=1.0 pulls langchain-core 1.x which breaks the stack
+langchain-groq>=0.2,<1.0
+
+# Cloud embeddings — fastembed is ONNX-based (NO PyTorch), ~80 MB
+# sentence-transformers / langchain-huggingface are intentionally excluded:
+# they pull in PyTorch (~1 GB) which exceeds Streamlit Cloud's free-tier RAM.
+fastembed>=0.3,<0.5
+
+# Vector store
+chromadb==1.0.9
+
+# Document loaders / processing
+pypdf==5.4.0
+unstructured==0.17.2
+
+# Web search
+duckduckgo-search==8.0.1
+# Optional: pip install tavily-python   (for Tavily search)
+
+# Web UI
+streamlit>=1.35,<1.50
+requests
+
+# PDF export
+fpdf2>=2.7
+
+# REST API
+fastapi==0.115.9
+uvicorn==0.34.2
+
+# Utilities
+python-dotenv==1.1.0
+rich==14.0.0
+typer==0.15.3
+pydantic==2.11.4
+httpx==0.28.1
