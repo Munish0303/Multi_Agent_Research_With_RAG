@@ -234,7 +234,7 @@ Create a specific task brief for each agent:
 Return as a structured plan.`;
     const plan = await runAgent("orchestrator", planTask, cfg, emit, {
       extraContext: refBlock || undefined,
-      maxTokens: 1024,
+      maxTokens: 700,
     });
 
     // ── 2. Research (optional real web search via Tavily) ───────────────────
@@ -265,6 +265,7 @@ Research this topic thoroughly. ${
 
     const findings = await runAgent("researcher", researchTask, cfg, emit, {
       extraContext: researchContext || undefined,
+      maxTokens: 1400,
     });
 
     // Citations = URLs from search results + any URLs the model surfaced.
@@ -286,7 +287,9 @@ Research Findings:
 ${clip(findings, 4000)}
 
 Analyze these findings critically. Identify patterns, evaluate evidence quality, and derive insights.`;
-    const analysis = await runAgent("analyst", analysisTask, cfg, emit);
+    const analysis = await runAgent("analyst", analysisTask, cfg, emit, {
+      maxTokens: 1400,
+    });
 
     // ── 4. Write ──────────────────────────────────────────────────────────--
     await emit({
@@ -304,7 +307,7 @@ Analysis:
 ${clip(analysis, 3000)}
 
 Write a comprehensive, well-structured research report. Include all key insights.`;
-    let draft = await runAgent("writer", writeTask, cfg, emit, { maxTokens: 3000 });
+    let draft = await runAgent("writer", writeTask, cfg, emit, { maxTokens: 1800 });
 
     // ── 5. Critique → revise loop ────────────────────────────────────────────
     let iteration = 0;
@@ -321,7 +324,9 @@ Draft Report:
 ${clip(draft, 5000)}
 
 Review this report critically. Evaluate quality, completeness, and accuracy.`;
-      critique = await runAgent("critic", critiqueTask, cfg, emit);
+      critique = await runAgent("critic", critiqueTask, cfg, emit, {
+        maxTokens: 900,
+      });
       iteration += 1;
 
       const m = critique.match(/SCORE:\s*(\d+)/i);
@@ -350,7 +355,7 @@ Critique received:
 ${clip(critique, 2000)}
 
 Rewrite the report addressing all critique points. Significantly improve the identified weaknesses.`;
-      draft = await runAgent("writer", reviseTask, cfg, emit, { maxTokens: 3000 });
+      draft = await runAgent("writer", reviseTask, cfg, emit, { maxTokens: 1800 });
     }
 
     // ── 6. Finalize ──────────────────────────────────────────────────────────
@@ -369,7 +374,7 @@ ${clip(critique, 2000)}
 
 Synthesize the draft and critique into a final, polished research report. Incorporate all feedback, resolve any gaps, and add an executive summary.`;
     const final = await runAgent("orchestrator", finalizeTask, cfg, emit, {
-      maxTokens: 3500,
+      maxTokens: 2200,
     });
 
     // ── Build the final markdown (matches workflow.py finalize_node) ─────────

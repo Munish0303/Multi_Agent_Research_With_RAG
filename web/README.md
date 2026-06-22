@@ -62,10 +62,11 @@ will not work. You must point Vercel at `web/`.
    but recommended so the app works out of the box.
 5. **Deploy.** You get a permanent public URL.
 
-> **Function duration:** the streaming endpoint is capped at 60s
-> (`vercel.json` → `maxDuration`, the Hobby-tier max). Defaults (8B model, 1
-> revision round) finish comfortably inside that. On Pro you can raise it for
-> the 70B model or more revision rounds.
+> **Function duration:** the streaming endpoint is capped at 60s via
+> `export const maxDuration = 60` in `app/api/research/route.ts` (the
+> Hobby-tier max). Defaults (8B model, 1 revision round) finish comfortably
+> inside that. On Pro you can raise it for the 70B model or more revision
+> rounds.
 
 ---
 

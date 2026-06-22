@@ -5,7 +5,8 @@
  * newline-delimited JSON (NDJSON). Each line is one PipelineEvent.
  *
  * Runs on the Node.js serverless runtime so the response can stream for the
- * full duration of a run (see maxDuration / vercel.json).
+ * full duration of a run (see the `maxDuration` route segment export below;
+ * 60s is the Vercel Hobby-tier max — raise it on Pro).
  */
 
 import { NextRequest } from "next/server";

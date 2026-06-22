@@ -39,6 +39,15 @@ const EXAMPLES = [
   "Economic effects of remote work",
 ];
 
+// Shown when a run ends before completing — almost always the serverless
+// time limit on Vercel's free (Hobby) tier.
+const TIMEOUT_MSG =
+  "The run didn't finish in time — Vercel's free (Hobby) tier kills any " +
+  "request after 60 seconds, and the full pipeline can exceed that with the " +
+  "70B model or multiple revision rounds. Fixes: use llama-3.1-8b-instant " +
+  "with 1 revision round (the safe default), keep the topic focused, or " +
+  "deploy on Vercel Pro and raise maxDuration for longer runs.";
+
 type AgentState = { text: string; status: "idle" | "streaming" | "done" };
 const blankAgents = (): Record<AgentKey, AgentState> =>
   AGENT_ORDER.reduce(
@@ -80,6 +89,7 @@ export default function Page() {
 
   const abortRef = useRef<AbortController | null>(null);
   const startRef = useRef<number>(0);
+  const userStoppedRef = useRef(false);
 
   // Discover server capabilities (default model, web search, key availability).
   useEffect(() => {
@@ -122,6 +132,14 @@ export default function Page() {
 
     const ctrl = new AbortController();
     abortRef.current = ctrl;
+    userStoppedRef.current = false;
+
+    let gotFinal = false;
+    let gotError = false;
+    let loopDone = false;
+    let stalled = false;
+    let lastActivity = Date.now();
+    const STALL_MS = 45000; // no events for this long => function likely timed out
 
     const advanceTo = (step: string) => {
       const idx = STEP_ORDER.indexOf(step);
@@ -135,6 +153,7 @@ export default function Page() {
     };
 
     const handle = (e: any) => {
+      lastActivity = Date.now();
       switch (e.type) {
         case "step":
           setStatusLine(e.message);
@@ -167,6 +186,7 @@ export default function Page() {
           setScore({ value: e.score, iteration: e.iteration });
           break;
         case "final":
+          gotFinal = true;
           setReport(e.markdown);
           setCitations(e.citations || []);
           setDoneSteps(new Set(STEP_ORDER));
@@ -175,10 +195,21 @@ export default function Page() {
           setOpenAgent(null);
           break;
         case "error":
+          gotError = true;
           setError({ message: e.message, daily: e.daily });
           break;
       }
     };
+
+    // Watchdog: if the stream goes silent for too long, the serverless function
+    // was almost certainly killed at the 60s limit — abort and surface why,
+    // instead of leaving the UI frozen mid-step.
+    const watchdog = window.setInterval(() => {
+      if (!gotFinal && !gotError && Date.now() - lastActivity > STALL_MS) {
+        stalled = true;
+        ctrl.abort();
+      }
+    }, 3000);
 
     try {
       const res = await fetch("/api/research", {
@@ -221,11 +252,34 @@ export default function Page() {
           }
         }
       }
+      loopDone = true; // stream closed normally
     } catch (err: any) {
-      if (err?.name !== "AbortError") {
+      if (err?.name === "AbortError") {
+        // Watchdog abort => timed out. User-initiated Stop => stay silent.
+        if (stalled && !userStoppedRef.current) setError({ message: TIMEOUT_MSG });
+      } else {
         setError({ message: err?.message || "Something went wrong." });
       }
     } finally {
+      window.clearInterval(watchdog);
+      // Stream closed cleanly but no final report arrived => the function was
+      // cut off (e.g. 60s limit) without a chance to emit an error event.
+      if (loopDone && !gotFinal && !gotError && !userStoppedRef.current) {
+        setError({ message: TIMEOUT_MSG });
+      }
+      // Stop any agent left mid-stream (error/timeout/stop interrupted it)
+      // so its card doesn't spin forever.
+      setAgents((prev) => {
+        let changed = false;
+        const next = { ...prev };
+        for (const k of AGENT_ORDER) {
+          if (next[k].status === "streaming") {
+            next[k] = { ...next[k], status: "done" };
+            changed = true;
+          }
+        }
+        return changed ? next : prev;
+      });
       setRunning(false);
       abortRef.current = null;
     }
@@ -241,7 +295,10 @@ export default function Page() {
     userKey,
   ]);
 
-  const stop = () => abortRef.current?.abort();
+  const stop = () => {
+    userStoppedRef.current = true;
+    abortRef.current?.abort();
+  };
 
   const downloadMd = () => {
     if (!report) return;
@@ -347,6 +404,13 @@ export default function Page() {
                   )
                 )}
               </select>
+              {(model.includes("70b") || maxIterations > 1) && (
+                <p className="hint" style={{ color: "var(--amber)" }}>
+                  70B and/or multiple rounds are slower — on Vercel&apos;s free tier
+                  (60s limit) long runs can get cut off. 8B + 1 round is the safe
+                  default.
+                </p>
+              )}
             </div>
 
             <div>
