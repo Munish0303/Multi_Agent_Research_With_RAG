@@ -165,6 +165,31 @@ The repo pins **Python 3.11** (`runtime.txt`) and uses **fastembed** instead of 
 
 ---
 
+## Interactive web app on Vercel
+
+There's also a second, fully interactive front-end built to deploy on **Vercel**,
+in [`web/`](./web). It runs the **same five-agent pipeline** (Orchestrator →
+Researcher → Analyst → Writer → Critic, with the critique→revise loop) but
+reimplemented in **Next.js + TypeScript**, calling Groq directly and **streaming
+each agent's output live** to the browser. The Python/Streamlit app here is
+untouched — `web/` is self-contained.
+
+Deploy: import the repo on Vercel and **set the project's Root Directory to
+`web`** (the repo root is a Python project, so Vercel must build the subdirectory
+instead), then add a `GROQ_API_KEY` env var. Full guide in
+[`web/README.md`](./web/README.md).
+
+```bash
+cd web && npm install && npm run dev   # http://localhost:3000
+```
+
+> RAG over uploaded documents, DuckDuckGo keyless search, and the Analyst's
+> Python execution are Streamlit-only (they don't fit Vercel's serverless
+> model). The Vercel app substitutes an optional "reference notes" field and
+> Tavily search. See [`web/README.md`](./web/README.md) for the full mapping.
+
+---
+
 ## Output
 
 Each run produces two files in `./outputs/`:
@@ -212,7 +237,12 @@ Multi_Agent_Research_RAG/
 ├── .streamlit/          # Theme + secrets template
 ├── DEPLOYMENT.md        # Cloud deployment guide
 ├── .env.example
-└── requirements.txt
+├── requirements.txt
+│
+└── web/                 # Interactive Next.js front-end for Vercel (self-contained)
+    ├── app/             # UI (page.tsx) + streaming API route (api/research)
+    ├── lib/             # pipeline.ts (5-agent flow), groq.ts, search.ts
+    └── README.md        # Vercel deployment guide (Root Directory = web)
 ```
 
 ---
