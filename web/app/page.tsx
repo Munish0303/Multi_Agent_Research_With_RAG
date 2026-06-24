@@ -133,6 +133,27 @@ export default function Page() {
       .catch(() => {});
   }, []);
 
+  // Remember a user-entered key across refreshes (only used when there's no
+  // server GROQ_API_KEY). Load once on mount.
+  useEffect(() => {
+    try {
+      const saved = localStorage.getItem("groqKey");
+      if (saved) setUserKey(saved);
+    } catch {
+      /* localStorage unavailable — ignore */
+    }
+  }, []);
+
+  // Persist the key as it changes.
+  useEffect(() => {
+    try {
+      if (userKey.trim()) localStorage.setItem("groqKey", userKey.trim());
+      else localStorage.removeItem("groqKey");
+    } catch {
+      /* ignore */
+    }
+  }, [userKey]);
+
   // Live elapsed timer.
   useEffect(() => {
     if (!running) return;
@@ -560,16 +581,27 @@ export default function Page() {
             </div>
 
             <div>
-              <label className="field">Your Groq API key (optional)</label>
-              <input
-                type="password"
-                placeholder={serverInfo?.serverKey ? "Using server key" : "gsk_..."}
-                value={userKey}
-                onChange={(e) => setUserKey(e.target.value)}
-                disabled={running}
-                autoComplete="off"
-              />
-              <p className="hint">Stays in your browser; sent only to run your request.</p>
+              <label className="field">Groq API key</label>
+              {serverInfo?.serverKey ? (
+                <p className="hint" style={{ color: "var(--green)", marginTop: 8 }}>
+                  ✓ Using the server&apos;s GROQ_API_KEY — no key needed here.
+                </p>
+              ) : (
+                <>
+                  <input
+                    type="password"
+                    placeholder="gsk_..."
+                    value={userKey}
+                    onChange={(e) => setUserKey(e.target.value)}
+                    disabled={running}
+                    autoComplete="off"
+                  />
+                  <p className="hint">
+                    Saved in this browser so you don&apos;t re-enter it. To skip this
+                    entirely, set <code>GROQ_API_KEY</code> in your Vercel env vars.
+                  </p>
+                </>
+              )}
             </div>
 
             <div style={{ gridColumn: "1 / -1" }}>
