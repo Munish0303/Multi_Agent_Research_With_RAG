@@ -10,7 +10,7 @@
  * Inter-agent text is clipped to the same char budgets to bound token usage.
  */
 
-import { streamChat, ChatMessage, DailyLimitError } from "./groq";
+import { streamChat, ChatMessage } from "./groq";
 import { tavilySearch, formatResults, SearchResult } from "./search";
 
 // ── Event protocol emitted to the client (NDJSON) ────────────────────────────
@@ -23,11 +23,15 @@ export type PipelineEvent =
   | { type: "citations"; urls: string[] }
   | { type: "score"; score: number; iteration: number }
   | {
-      type: "final";
-      report: string;
-      markdown: string;
-      citations: string[];
-      durationMs: number;
+      // Emitted once at the end of each step request with the new full state,
+      // the tokens the step consumed (for client-side pacing), and — on the
+      // finalize step — the assembled report + markdown.
+      type: "result";
+      step: StepName;
+      tokensUsed: number;
+      state: PipelineState;
+      report?: string;
+      markdown?: string;
     }
   | { type: "error"; message: string; daily?: boolean };
 
@@ -52,6 +56,42 @@ export interface RunConfig {
   tavilyKey?: string;
   /** Optional pasted reference notes (lightweight RAG substitute). */
   context?: string;
+}
+
+// One agent runs per HTTP request; the browser orchestrates the sequence and
+// paces the calls to stay under Groq's per-minute token limit. The full state
+// is carried between requests so each step is self-contained.
+export type StepName =
+  | "plan"
+  | "research"
+  | "analyze"
+  | "write"
+  | "review"
+  | "revise"
+  | "finalize";
+
+export interface PipelineState {
+  plan: string;
+  findings: string;
+  citations: string[];
+  analysis: string;
+  draft: string;
+  critique: string;
+  iteration: number;
+  score: number;
+}
+
+export function emptyState(): PipelineState {
+  return {
+    plan: "",
+    findings: "",
+    citations: [],
+    analysis: "",
+    draft: "",
+    critique: "",
+    iteration: 0,
+    score: 0,
+  };
 }
 
 // ── System prompts (verbatim from agents/*.py) ───────────────────────────────
@@ -176,7 +216,11 @@ async function runAgent(
   task: string,
   cfg: RunConfig,
   emit: Emit,
-  opts: { extraContext?: string; maxTokens?: number } = {}
+  opts: {
+    extraContext?: string;
+    maxTokens?: number;
+    onUsage?: (totalTokens: number) => void;
+  } = {}
 ): Promise<string> {
   await emit({ type: "agent_start", agent, label: LABELS[agent] });
 
@@ -197,6 +241,7 @@ async function runAgent(
     temperature: tempFor(agent, cfg.style),
     messages,
     maxTokens: opts.maxTokens ?? 2048,
+    onUsage: opts.onUsage,
   })) {
     out += delta;
     await emit({ type: "token", agent, text: delta });
@@ -208,22 +253,44 @@ async function runAgent(
 
 // ── The pipeline ─────────────────────────────────────────────────────────────
 
-export async function runResearch(cfg: RunConfig, emit: Emit): Promise<void> {
-  const start = Date.now();
+/**
+ * Run a SINGLE agent step. The browser calls this once per step (carrying the
+ * full state between calls) and paces the calls to respect Groq's per-minute
+ * token limit. Returns the updated state and the tokens this step consumed;
+ * the `finalize` step also returns the assembled report + markdown.
+ *
+ * Errors are thrown (not caught) so the route can translate them — including
+ * DailyLimitError — into a single `error` event.
+ */
+export async function runStep(
+  step: StepName,
+  cfg: RunConfig,
+  state: PipelineState,
+  emit: Emit
+): Promise<{
+  state: PipelineState;
+  tokensUsed: number;
+  report?: string;
+  markdown?: string;
+}> {
+  let tokensUsed = 0;
+  const onUsage = (t: number) => {
+    tokensUsed += t;
+  };
 
-  // Build the optional reference-documents block once (lightweight RAG).
+  // Optional reference-documents block (lightweight RAG substitute).
   const refBlock = cfg.context?.trim()
-    ? `<reference_documents>\n${clip(cfg.context.trim(), 6000)}\n</reference_documents>`
+    ? `<reference_documents>\n${clip(cfg.context.trim(), 2000)}\n</reference_documents>`
     : "";
 
-  try {
-    // ── 1. Plan ────────────────────────────────────────────────────────────
-    await emit({
-      step: "plan",
-      type: "step",
-      message: "Orchestrator: Planning research strategy...",
-    });
-    const planTask = `Research topic: ${cfg.topic}
+  // Work on a copy; the caller stores whatever we return.
+  const s: PipelineState = { ...state, citations: [...state.citations] };
+
+  switch (step) {
+    // ── Plan ────────────────────────────────────────────────────────────────
+    case "plan": {
+      await emit({ type: "step", step, message: "Orchestrator: Planning research strategy..." });
+      const planTask = `Research topic: ${cfg.topic}
 
 Create a specific task brief for each agent:
 - Researcher: What to research and gather
@@ -232,175 +299,139 @@ Create a specific task brief for each agent:
 - Critic: What quality standards to enforce
 
 Return as a structured plan.`;
-    const plan = await runAgent("orchestrator", planTask, cfg, emit, {
-      extraContext: refBlock || undefined,
-      maxTokens: 700,
-    });
-
-    // ── 2. Research (optional real web search via Tavily) ───────────────────
-    await emit({
-      step: "research",
-      type: "step",
-      message: "Researcher: Gathering information from the web...",
-    });
-
-    let webResults: SearchResult[] = [];
-    let webBlock = "";
-    if (cfg.useWebSearch && cfg.tavilyKey) {
-      webResults = await tavilySearch(cfg.topic, cfg.tavilyKey, 6);
-      if (webResults.length) {
-        webBlock = `<web_search_results>\n${formatResults(webResults)}\n</web_search_results>`;
-      }
+      s.plan = await runAgent("orchestrator", planTask, cfg, emit, {
+        extraContext: refBlock || undefined,
+        maxTokens: 500,
+        onUsage,
+      });
+      break;
     }
 
-    const researchContext = [refBlock, webBlock].filter(Boolean).join("\n\n");
-    const researchTask = `Topic: ${cfg.topic}
-Plan context: ${clip(plan, 500)}
+    // ── Research (optional real web search via Tavily) ───────────────────────
+    case "research": {
+      await emit({ type: "step", step, message: "Researcher: Gathering information from the web..." });
+      let webResults: SearchResult[] = [];
+      let webBlock = "";
+      if (cfg.useWebSearch && cfg.tavilyKey) {
+        webResults = await tavilySearch(cfg.topic, cfg.tavilyKey, 4);
+        if (webResults.length) {
+          // Clip combined results so the request stays well under the per-minute cap.
+          webBlock = `<web_search_results>\n${clip(formatResults(webResults), 2200)}\n</web_search_results>`;
+        }
+      }
+      const researchContext = [refBlock, webBlock].filter(Boolean).join("\n\n");
+      const researchTask = `Topic: ${cfg.topic}
+Plan context: ${clip(s.plan, 500)}
 
 Research this topic thoroughly. ${
-      webBlock
-        ? "Use the web search results provided above and analyze any reference documents."
-        : "Analyze available documents and draw on your knowledge."
-    } Extract key facts, statistics, and insights, and cite sources with their URLs.`;
+        webBlock
+          ? "Use the web search results provided above and analyze any reference documents."
+          : "Analyze available documents and draw on your knowledge."
+      } Extract key facts, statistics, and insights, and cite sources with their URLs.`;
+      s.findings = await runAgent("researcher", researchTask, cfg, emit, {
+        extraContext: researchContext || undefined,
+        maxTokens: 800,
+        onUsage,
+      });
+      s.citations = Array.from(
+        new Set([...webResults.map((r) => r.url).filter(Boolean), ...extractUrls(s.findings)])
+      );
+      await emit({ type: "citations", urls: s.citations });
+      break;
+    }
 
-    const findings = await runAgent("researcher", researchTask, cfg, emit, {
-      extraContext: researchContext || undefined,
-      maxTokens: 1400,
-    });
-
-    // Citations = URLs from search results + any URLs the model surfaced.
-    const citations = Array.from(
-      new Set([...webResults.map((r) => r.url).filter(Boolean), ...extractUrls(findings)])
-    );
-    await emit({ type: "citations", urls: citations });
-
-    // ── 3. Analyze ──────────────────────────────────────────────────────────
-    await emit({
-      step: "analyze",
-      type: "step",
-      message: "Analyst: Identifying patterns and evaluating evidence...",
-    });
-    const analysisTask = `Topic: ${cfg.topic}
-Plan context: ${clip(plan, 300)}
+    // ── Analyze ──────────────────────────────────────────────────────────────
+    case "analyze": {
+      await emit({ type: "step", step, message: "Analyst: Identifying patterns and evaluating evidence..." });
+      const analysisTask = `Topic: ${cfg.topic}
+Plan context: ${clip(s.plan, 300)}
 
 Research Findings:
-${clip(findings, 4000)}
+${clip(s.findings, 2200)}
 
 Analyze these findings critically. Identify patterns, evaluate evidence quality, and derive insights.`;
-    const analysis = await runAgent("analyst", analysisTask, cfg, emit, {
-      maxTokens: 1400,
-    });
+      s.analysis = await runAgent("analyst", analysisTask, cfg, emit, {
+        maxTokens: 800,
+        onUsage,
+      });
+      break;
+    }
 
-    // ── 4. Write ──────────────────────────────────────────────────────────--
-    await emit({
-      step: "write",
-      type: "step",
-      message: "Writer: Drafting the research report...",
-    });
-    const writeTask = `Topic: ${cfg.topic}
-Plan context: ${clip(plan, 300)}
+    // ── Write ──────────────────────────────────────────────────────────────--
+    case "write": {
+      await emit({ type: "step", step, message: "Writer: Drafting the research report..." });
+      const writeTask = `Topic: ${cfg.topic}
+Plan context: ${clip(s.plan, 300)}
 
 Research Findings:
-${clip(findings, 4000)}
+${clip(s.findings, 2200)}
 
 Analysis:
-${clip(analysis, 3000)}
+${clip(s.analysis, 1500)}
 
 Write a comprehensive, well-structured research report. Include all key insights.`;
-    let draft = await runAgent("writer", writeTask, cfg, emit, { maxTokens: 1800 });
+      s.draft = await runAgent("writer", writeTask, cfg, emit, { maxTokens: 1100, onUsage });
+      break;
+    }
 
-    // ── 5. Critique → revise loop ────────────────────────────────────────────
-    let iteration = 0;
-    let critique = "";
-    while (true) {
-      await emit({
-        step: "review",
-        type: "step",
-        message: "Critic: Reviewing and scoring the draft...",
-      });
+    // ── Review (critique + score) ────────────────────────────────────────────
+    case "review": {
+      await emit({ type: "step", step, message: "Critic: Reviewing and scoring the draft..." });
       const critiqueTask = `Topic: ${cfg.topic}
 
 Draft Report:
-${clip(draft, 5000)}
+${clip(s.draft, 2800)}
 
 Review this report critically. Evaluate quality, completeness, and accuracy.`;
-      critique = await runAgent("critic", critiqueTask, cfg, emit, {
-        maxTokens: 900,
-      });
-      iteration += 1;
+      s.critique = await runAgent("critic", critiqueTask, cfg, emit, { maxTokens: 650, onUsage });
+      s.iteration += 1;
+      const m = s.critique.match(/SCORE:\s*(\d+)/i);
+      s.score = m ? parseInt(m[1], 10) : 0;
+      await emit({ type: "score", score: s.score, iteration: s.iteration });
+      break;
+    }
 
-      const m = critique.match(/SCORE:\s*(\d+)/i);
-      const score = m ? parseInt(m[1], 10) : NaN;
-      await emit({
-        type: "score",
-        score: Number.isNaN(score) ? 0 : score,
-        iteration,
-      });
-
-      const passed = !Number.isNaN(score) && score >= cfg.qualityThreshold;
-      if (iteration >= cfg.maxIterations || passed) break;
-
-      // Revise
-      await emit({
-        step: "revise",
-        type: "step",
-        message: "Writer: Revising report based on critique...",
-      });
+    // ── Revise ───────────────────────────────────────────────────────────────
+    case "revise": {
+      await emit({ type: "step", step, message: "Writer: Revising report based on critique..." });
       const reviseTask = `Topic: ${cfg.topic}
 
 Original Draft:
-${clip(draft, 5000)}
+${clip(s.draft, 2800)}
 
 Critique received:
-${clip(critique, 2000)}
+${clip(s.critique, 1200)}
 
 Rewrite the report addressing all critique points. Significantly improve the identified weaknesses.`;
-      draft = await runAgent("writer", reviseTask, cfg, emit, { maxTokens: 1800 });
+      s.draft = await runAgent("writer", reviseTask, cfg, emit, { maxTokens: 1100, onUsage });
+      break;
     }
 
-    // ── 6. Finalize ──────────────────────────────────────────────────────────
-    await emit({
-      step: "finalize",
-      type: "step",
-      message: "Orchestrator: Synthesizing final report...",
-    });
-    const finalizeTask = `Topic: ${cfg.topic}
+    // ── Finalize ─────────────────────────────────────────────────────────────
+    case "finalize": {
+      await emit({ type: "step", step, message: "Orchestrator: Synthesizing final report..." });
+      const finalizeTask = `Topic: ${cfg.topic}
 
 Draft Report:
-${clip(draft, 6000)}
+${clip(s.draft, 3200)}
 
 Critique:
-${clip(critique, 2000)}
+${clip(s.critique, 1200)}
 
 Synthesize the draft and critique into a final, polished research report. Incorporate all feedback, resolve any gaps, and add an executive summary.`;
-    const final = await runAgent("orchestrator", finalizeTask, cfg, emit, {
-      maxTokens: 2200,
-    });
-
-    // ── Build the final markdown (matches workflow.py finalize_node) ─────────
-    let refs = "";
-    if (citations.length) {
-      refs =
-        "\n\n## References\n\n" +
-        citations.map((u, i) => `${i + 1}. ${u}`).join("\n");
-    }
-    const markdown = `# Research Report: ${cfg.topic}\n\n${final}${refs}\n\n---\n*Generated by the Multi-Agent Research System*`;
-
-    await emit({
-      type: "final",
-      report: final,
-      markdown,
-      citations,
-      durationMs: Date.now() - start,
-    });
-  } catch (err) {
-    if (err instanceof DailyLimitError) {
-      await emit({ type: "error", message: err.message, daily: true });
-    } else {
-      await emit({
-        type: "error",
-        message: err instanceof Error ? err.message : String(err),
+      const final = await runAgent("orchestrator", finalizeTask, cfg, emit, {
+        maxTokens: 1200,
+        onUsage,
       });
+
+      let refs = "";
+      if (s.citations.length) {
+        refs = "\n\n## References\n\n" + s.citations.map((u, i) => `${i + 1}. ${u}`).join("\n");
+      }
+      const markdown = `# Research Report: ${cfg.topic}\n\n${final}${refs}\n\n---\n*Generated by the Multi-Agent Research System*`;
+      return { state: s, tokensUsed, report: final, markdown };
     }
   }
+
+  return { state: s, tokensUsed };
 }

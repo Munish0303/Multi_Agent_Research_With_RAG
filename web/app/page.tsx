@@ -39,14 +39,44 @@ const EXAMPLES = [
   "Economic effects of remote work",
 ];
 
-// Shown when a run ends before completing — almost always the serverless
-// time limit on Vercel's free (Hobby) tier.
+// Shown when a single step stalls with no response (a real hang, not pacing).
 const TIMEOUT_MSG =
-  "The run didn't finish in time — Vercel's free (Hobby) tier kills any " +
-  "request after 60 seconds, and the full pipeline can exceed that with the " +
-  "70B model or multiple revision rounds. Fixes: use llama-3.1-8b-instant " +
-  "with 1 revision round (the safe default), keep the topic focused, or " +
-  "deploy on Vercel Pro and raise maxDuration for longer runs.";
+  "A step stopped responding and was cancelled. This is usually a transient " +
+  "Groq hiccup — try again. If it persists, switch to llama-3.1-8b-instant " +
+  "and keep the topic focused.";
+
+// ── Client-side rate pacing ──────────────────────────────────────────────────
+// Groq's free tier caps llama-3.1-8b-instant at 6,000 tokens/minute. We run one
+// agent per request and throttle between requests so the rolling 60-second
+// token total stays under budget — no 429s, no need to pay, and (because the
+// waits happen here, not inside a serverless function) no 60s timeout.
+const PACE_BUDGET = 5200; // tokens per rolling 60s window (margin under 6,000)
+const PACE_WINDOW = 60000;
+const PACE_EST = 2400; // assumed tokens for the next step, used for the pre-check
+const STALL_MS = 45000; // a single step silent this long => cancel it
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+interface RunState {
+  plan: string;
+  findings: string;
+  citations: string[];
+  analysis: string;
+  draft: string;
+  critique: string;
+  iteration: number;
+  score: number;
+}
+const emptyRunState = (): RunState => ({
+  plan: "",
+  findings: "",
+  citations: [],
+  analysis: "",
+  draft: "",
+  critique: "",
+  iteration: 0,
+  score: 0,
+});
 
 type AgentState = { text: string; status: "idle" | "streaming" | "done" };
 const blankAgents = (): Record<AgentKey, AgentState> =>
@@ -90,6 +120,7 @@ export default function Page() {
   const abortRef = useRef<AbortController | null>(null);
   const startRef = useRef<number>(0);
   const userStoppedRef = useRef(false);
+  const tokenLogRef = useRef<{ t: number; tokens: number }[]>([]);
 
   // Discover server capabilities (default model, web search, key availability).
   useEffect(() => {
@@ -111,7 +142,7 @@ export default function Page() {
 
   const keyMissing = !!serverInfo && !serverInfo.serverKey && !userKey.trim();
 
-  // ── Run the pipeline (read the NDJSON stream) ───────────────────────────--
+  // ── Run the pipeline: one agent per request, paced on the client ──────────--
   const run = useCallback(async () => {
     const t = topic.trim();
     if (!t || running) return;
@@ -124,26 +155,33 @@ export default function Page() {
     setAgents(blankAgents());
     setDoneSteps(new Set());
     setCurrentStep(null);
-    setStatusLine("Connecting…");
+    setStatusLine("Starting…");
     setOpenAgent(null);
     setElapsed(0);
     startRef.current = Date.now();
+    tokenLogRef.current = [];
+    userStoppedRef.current = false;
     setRunning(true);
 
     const ctrl = new AbortController();
     abortRef.current = ctrl;
-    userStoppedRef.current = false;
 
-    let gotFinal = false;
-    let gotError = false;
-    let loopDone = false;
-    let stalled = false;
     let lastActivity = Date.now();
-    const STALL_MS = 45000; // no events for this long => function likely timed out
+    let stalled = false;
+    let handledError = false;
+
+    const cfgBase = {
+      topic: t,
+      model,
+      style,
+      useWebSearch,
+      context: context.trim() || undefined,
+      apiKey: userKey.trim() || undefined,
+    };
 
     const advanceTo = (step: string) => {
       const idx = STEP_ORDER.indexOf(step);
-      if (idx === -1) return; // init / revise — not a stepper node
+      if (idx === -1) return;
       setDoneSteps((prev) => {
         const next = new Set(prev);
         for (let i = 0; i < idx; i++) next.add(STEP_ORDER[i]);
@@ -152,90 +190,58 @@ export default function Page() {
       setCurrentStep(step);
     };
 
-    const handle = (e: any) => {
-      lastActivity = Date.now();
-      switch (e.type) {
-        case "step":
-          setStatusLine(e.message);
-          if (e.step === "revise") advanceTo("write");
-          else advanceTo(e.step);
-          break;
-        case "agent_start": {
-          const k = e.agent as AgentKey;
-          setOpenAgent(k);
-          setAgents((prev) => ({ ...prev, [k]: { text: "", status: "streaming" } }));
-          break;
-        }
-        case "token": {
-          const k = e.agent as AgentKey;
-          setAgents((prev) => ({
-            ...prev,
-            [k]: { text: prev[k].text + e.text, status: "streaming" },
-          }));
-          break;
-        }
-        case "agent_done": {
-          const k = e.agent as AgentKey;
-          setAgents((prev) => ({ ...prev, [k]: { ...prev[k], status: "done" } }));
-          break;
-        }
-        case "citations":
-          setCitations(e.urls || []);
-          break;
-        case "score":
-          setScore({ value: e.score, iteration: e.iteration });
-          break;
-        case "final":
-          gotFinal = true;
-          setReport(e.markdown);
-          setCitations(e.citations || []);
-          setDoneSteps(new Set(STEP_ORDER));
-          setCurrentStep(null);
-          setStatusLine(`Done in ${(e.durationMs / 1000).toFixed(1)}s`);
-          setOpenAgent(null);
-          break;
-        case "error":
-          gotError = true;
-          setError({ message: e.message, daily: e.daily });
-          break;
-      }
-    };
-
-    // Watchdog: if the stream goes silent for too long, the serverless function
-    // was almost certainly killed at the 60s limit — abort and surface why,
-    // instead of leaving the UI frozen mid-step.
+    // Watchdog: cancel the run only if the *active* step goes silent. Pacing
+    // waits refresh lastActivity, so intentional pauses don't trip it.
     const watchdog = window.setInterval(() => {
-      if (!gotFinal && !gotError && Date.now() - lastActivity > STALL_MS) {
+      if (Date.now() - lastActivity > STALL_MS) {
         stalled = true;
         ctrl.abort();
       }
     }, 3000);
 
-    try {
+    // Throttle before a step so the rolling 60s token total stays under budget.
+    const paceFor = async () => {
+      while (true) {
+        if (userStoppedRef.current) throw new DOMException("aborted", "AbortError");
+        const now = Date.now();
+        tokenLogRef.current = tokenLogRef.current.filter((e) => now - e.t < PACE_WINDOW);
+        const sum = tokenLogRef.current.reduce((a, e) => a + e.tokens, 0);
+        if (tokenLogRef.current.length === 0 || sum + PACE_EST <= PACE_BUDGET) break;
+        const oldest = tokenLogRef.current[0];
+        const waitMs = Math.min(PACE_WINDOW - (now - oldest.t) + 800, 20000);
+        for (let waited = 0; waited < waitMs; waited += 1000) {
+          if (userStoppedRef.current) throw new DOMException("aborted", "AbortError");
+          lastActivity = Date.now(); // pacing is intentional — keep the watchdog happy
+          setStatusLine(
+            `Pacing to stay within the free Groq rate limit… ${Math.ceil(
+              (waitMs - waited) / 1000
+            )}s`
+          );
+          await sleep(1000);
+        }
+      }
+    };
+
+    // Run one step: POST, stream its events into the UI, return the new state.
+    const runOneStep = async (
+      step: string,
+      state: RunState
+    ): Promise<{ state: RunState; markdown?: string }> => {
       const res = await fetch("/api/research", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         signal: ctrl.signal,
-        body: JSON.stringify({
-          topic: t,
-          model,
-          style,
-          maxIterations,
-          qualityThreshold,
-          useWebSearch,
-          context: context.trim() || undefined,
-          apiKey: userKey.trim() || undefined,
-        }),
+        body: JSON.stringify({ ...cfgBase, step, state }),
       });
-
       if (!res.ok || !res.body) {
         const data = await res.json().catch(() => ({}));
         throw new Error(data.error || `Request failed (${res.status})`);
       }
-
       const reader = res.body.getReader();
       const decoder = new TextDecoder();
       let buffer = "";
+      let result: { state: RunState; markdown?: string } | null = null;
+
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
@@ -243,32 +249,112 @@ export default function Page() {
         const lines = buffer.split("\n");
         buffer = lines.pop() ?? "";
         for (const line of lines) {
-          const s = line.trim();
-          if (!s) continue;
+          const sLine = line.trim();
+          if (!sLine) continue;
+          let e: any;
           try {
-            handle(JSON.parse(s));
+            e = JSON.parse(sLine);
           } catch {
-            /* partial line — shouldn't happen after split, ignore */
+            continue;
+          }
+          lastActivity = Date.now();
+          switch (e.type) {
+            case "step":
+              setStatusLine(e.message);
+              break;
+            case "agent_start": {
+              const k = e.agent as AgentKey;
+              setOpenAgent(k);
+              setAgents((prev) => ({ ...prev, [k]: { text: "", status: "streaming" } }));
+              break;
+            }
+            case "token": {
+              const k = e.agent as AgentKey;
+              setAgents((prev) => ({
+                ...prev,
+                [k]: { text: prev[k].text + e.text, status: "streaming" },
+              }));
+              break;
+            }
+            case "agent_done": {
+              const k = e.agent as AgentKey;
+              setAgents((prev) => ({ ...prev, [k]: { ...prev[k], status: "done" } }));
+              break;
+            }
+            case "citations":
+              setCitations(e.urls || []);
+              break;
+            case "score":
+              setScore({ value: e.score, iteration: e.iteration });
+              break;
+            case "result":
+              result = { state: e.state as RunState, markdown: e.markdown };
+              if (typeof e.tokensUsed === "number" && e.tokensUsed > 0) {
+                tokenLogRef.current.push({ t: Date.now(), tokens: e.tokensUsed });
+              }
+              break;
+            case "error":
+              handledError = true;
+              setError({ message: e.message, daily: e.daily });
+              throw new Error(e.message);
           }
         }
       }
-      loopDone = true; // stream closed normally
+      if (!result) throw new Error("Step ended without a result.");
+      return result;
+    };
+
+    try {
+      let state = emptyRunState();
+
+      advanceTo("plan");
+      state = (await runOneStep("plan", state)).state;
+
+      await paceFor();
+      advanceTo("research");
+      state = (await runOneStep("research", state)).state;
+
+      await paceFor();
+      advanceTo("analyze");
+      state = (await runOneStep("analyze", state)).state;
+
+      await paceFor();
+      advanceTo("write");
+      state = (await runOneStep("write", state)).state;
+
+      // Critique → revise loop (client controls the rounds).
+      while (true) {
+        await paceFor();
+        advanceTo("review");
+        state = (await runOneStep("review", state)).state;
+        const passed = state.score >= qualityThreshold;
+        if (state.iteration >= maxIterations || passed) break;
+        await paceFor();
+        advanceTo("write");
+        state = (await runOneStep("revise", state)).state;
+      }
+
+      await paceFor();
+      advanceTo("finalize");
+      const fin = await runOneStep("finalize", state);
+      state = fin.state;
+
+      if (fin.markdown) setReport(fin.markdown);
+      setCitations(state.citations || []);
+      setDoneSteps(new Set(STEP_ORDER));
+      setCurrentStep(null);
+      setOpenAgent(null);
+      setStatusLine(`Done in ${((Date.now() - startRef.current) / 1000).toFixed(1)}s`);
     } catch (err: any) {
       if (err?.name === "AbortError") {
-        // Watchdog abort => timed out. User-initiated Stop => stay silent.
+        // Watchdog stall => show timeout. User pressed Stop => stay silent.
         if (stalled && !userStoppedRef.current) setError({ message: TIMEOUT_MSG });
-      } else {
+      } else if (!handledError) {
         setError({ message: err?.message || "Something went wrong." });
       }
     } finally {
       window.clearInterval(watchdog);
-      // Stream closed cleanly but no final report arrived => the function was
-      // cut off (e.g. 60s limit) without a chance to emit an error event.
-      if (loopDone && !gotFinal && !gotError && !userStoppedRef.current) {
-        setError({ message: TIMEOUT_MSG });
-      }
-      // Stop any agent left mid-stream (error/timeout/stop interrupted it)
-      // so its card doesn't spin forever.
+      // Stop any agent left mid-stream so its card doesn't spin forever.
       setAgents((prev) => {
         let changed = false;
         const next = { ...prev };

@@ -54,8 +54,10 @@ export async function* streamChat(opts: {
   messages: ChatMessage[];
   maxTokens?: number;
   maxRetries?: number;
+  /** Called once with Groq's token usage for this call (for client-side pacing). */
+  onUsage?: (totalTokens: number) => void;
 }): AsyncGenerator<string, void, unknown> {
-  const { apiKey, model, temperature, messages, maxTokens = 2048 } = opts;
+  const { apiKey, model, temperature, messages, maxTokens = 2048, onUsage } = opts;
   const maxRetries = opts.maxRetries ?? 3;
 
   for (let attempt = 0; attempt < maxRetries; attempt++) {
@@ -72,6 +74,7 @@ export async function* streamChat(opts: {
           temperature,
           max_tokens: maxTokens,
           stream: true,
+          stream_options: { include_usage: true },
           messages,
         }),
       });
@@ -129,6 +132,10 @@ export async function* streamChat(opts: {
         if (data === "[DONE]") return;
         try {
           const json = JSON.parse(data);
+          // The final chunk (include_usage) carries usage with empty choices.
+          if (json?.usage?.total_tokens && onUsage) {
+            onUsage(json.usage.total_tokens as number);
+          }
           const delta = json?.choices?.[0]?.delta?.content;
           if (delta) yield delta as string;
         } catch {
